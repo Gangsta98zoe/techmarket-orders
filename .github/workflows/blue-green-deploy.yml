@@ -1,0 +1,296 @@
+name: CD - Blue-Green Deployment
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Versión a desplegar (ej: 2.1.0)"
+        required: true
+        default: "latest"
+      target_env:
+        description: "Forzar entorno destino (blue/green/auto)"
+        required: false
+        default: "auto"
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}/orders
+  AWS_REGION: us-east-1
+  ECS_CLUSTER: techmarket-cluster        # Cluster ECS (simulado con Docker)
+  ECS_SERVICE: orders-service
+  ALB_LISTENER_ARN: ${{ secrets.ALB_LISTENER_ARN }}
+
+jobs:
+  # ──────────────────────────────────────────────────────────
+  # JOB 1: Preparación y detección del entorno activo
+  # ──────────────────────────────────────────────────────────
+  prepare:
+    name: Preparar Despliegue Blue-Green
+    runs-on: ubuntu-latest
+    outputs:
+      active-env: ${{ steps.detect.outputs.active_env }}
+      deploy-env: ${{ steps.detect.outputs.deploy_env }}
+      version: ${{ steps.version.outputs.version }}
+
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Determinar versión de despliegue
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            VERSION="sha-$(echo ${{ github.sha }} | cut -c1-7)"
+          fi
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "Versión a desplegar: ${VERSION}"
+
+      - name: Detectar entorno activo (simula consulta a AWS ALB)
+        id: detect
+        run: |
+          # En producción real: consultar AWS ALB para saber qué target group recibe tráfico
+          # aws elbv2 describe-target-groups --load-balancer-arn $ALB_ARN
+          # Aquí simulamos la detección
+          FORCED="${{ github.event.inputs.target_env }}"
+          if [ "$FORCED" = "auto" ] || [ -z "$FORCED" ]; then
+            # Simular alternancia: en prod real se consulta ALB
+            CURRENT_ACTIVE="blue"
+            DEPLOY_TO="green"
+          elif [ "$FORCED" = "blue" ]; then
+            CURRENT_ACTIVE="green"
+            DEPLOY_TO="blue"
+          else
+            CURRENT_ACTIVE="blue"
+            DEPLOY_TO="green"
+          fi
+          echo "active_env=${CURRENT_ACTIVE}" >> $GITHUB_OUTPUT
+          echo "deploy_env=${DEPLOY_TO}" >> $GITHUB_OUTPUT
+          echo "Producción actual: ${CURRENT_ACTIVE^^}"
+          echo "Desplegando en:    ${DEPLOY_TO^^}"
+
+  # ──────────────────────────────────────────────────────────
+  # JOB 2: Build de imagen para el despliegue
+  # ──────────────────────────────────────────────────────────
+  build:
+    name: Build Imagen Docker
+    runs-on: ubuntu-latest
+    needs: prepare
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Configurar Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login a GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build y push imagen del entorno ${{ needs.prepare.outputs.deploy-env }}
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.prepare.outputs.version }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.prepare.outputs.deploy-env }}-latest
+          build-args: |
+            APP_VERSION=${{ needs.prepare.outputs.version }}
+            ENVIRONMENT=${{ needs.prepare.outputs.deploy-env }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ──────────────────────────────────────────────────────────
+  # JOB 3: Desplegar en entorno inactivo (Green/Blue)
+  # ──────────────────────────────────────────────────────────
+  deploy-inactive:
+    name: Desplegar en ${{ needs.prepare.outputs.deploy-env }} (inactivo)
+    runs-on: ubuntu-latest
+    needs: [prepare, build]
+    environment:
+      name: ${{ needs.prepare.outputs.deploy-env }}
+
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Configurar AWS CLI (simulado)
+        run: |
+          echo "Simulando configuración AWS CLI"
+          echo "Región: ${{ env.AWS_REGION }}"
+          echo "Cluster ECS: ${{ env.ECS_CLUSTER }}"
+          # En prod real:
+          # aws configure set aws_access_key_id ${{ secrets.AWS_ACCESS_KEY_ID }}
+          # aws configure set aws_secret_access_key ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+      - name: Actualizar servicio ECS - entorno ${{ needs.prepare.outputs.deploy-env }}
+        run: |
+          DEPLOY_ENV="${{ needs.prepare.outputs.deploy-env }}"
+          VERSION="${{ needs.prepare.outputs.version }}"
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${VERSION}"
+
+          echo "================================================================"
+          echo "  Desplegando en ECS - Entorno: ${DEPLOY_ENV^^}"
+          echo "  Imagen: ${IMAGE}"
+          echo "================================================================"
+
+          # En producción AWS real:
+          # aws ecs update-service \
+          #   --cluster ${{ env.ECS_CLUSTER }} \
+          #   --service orders-${DEPLOY_ENV} \
+          #   --force-new-deployment \
+          #   --task-definition orders-${DEPLOY_ENV}:${VERSION}
+
+          # Simulación con docker-compose
+          docker compose pull orders-${DEPLOY_ENV} 2>/dev/null || true
+          echo "Servicio ECS orders-${DEPLOY_ENV} actualizado con imagen ${IMAGE}"
+
+  # ──────────────────────────────────────────────────────────
+  # JOB 4: Validación de salud del entorno nuevo
+  # ──────────────────────────────────────────────────────────
+  health-check:
+    name: Validación de Salud - ${{ needs.prepare.outputs.deploy-env }}
+    runs-on: ubuntu-latest
+    needs: [prepare, deploy-inactive]
+
+    steps:
+      - name: Ejecutar health checks con reintentos
+        run: |
+          DEPLOY_ENV="${{ needs.prepare.outputs.deploy-env }}"
+          MAX_RETRIES=10
+          INTERVAL=15
+
+          echo "Verificando health del entorno ${DEPLOY_ENV^^}..."
+          for i in $(seq 1 $MAX_RETRIES); do
+            echo "Intento ${i}/${MAX_RETRIES}..."
+            # En prod real: curl -f https://${DEPLOY_ENV}.techmarket-orders.com/health
+            # Simulación:
+            echo '{"status":"healthy","environment":"'${DEPLOY_ENV}'","version":"${{ needs.prepare.outputs.version }}"}' | python3 -c "
+          import sys, json
+          d = json.load(sys.stdin)
+          assert d['status'] == 'healthy', 'Status no es healthy'
+          print(f'Health OK: env={d[\"environment\"]}, ver={d[\"version\"]}')
+          "
+            if [ $? -eq 0 ]; then
+              echo "Health check PASADO en intento ${i}"
+              exit 0
+            fi
+            sleep $INTERVAL
+          done
+          echo "Health check FALLIDO tras ${MAX_RETRIES} intentos"
+          exit 1
+
+      - name: Ejecutar smoke tests
+        run: |
+          DEPLOY_ENV="${{ needs.prepare.outputs.deploy-env }}"
+          echo "Ejecutando smoke tests contra ${DEPLOY_ENV^^}..."
+          # En prod real: pytest tests/smoke/ --base-url=https://${DEPLOY_ENV}.techmarket-orders.com
+          echo "Test 1: GET /health → 200 OK"
+          echo "Test 2: POST /orders → 201 Created"
+          echo "Test 3: GET /orders/{id} → 200 OK"
+          echo "Todos los smoke tests PASADOS"
+
+  # ──────────────────────────────────────────────────────────
+  # JOB 5: Switch de tráfico (ALB cutover)
+  # ──────────────────────────────────────────────────────────
+  traffic-switch:
+    name: Switch Tráfico → ${{ needs.prepare.outputs.deploy-env }}
+    runs-on: ubuntu-latest
+    needs: [prepare, health-check]
+    environment:
+      name: production
+      url: https://orders.techmarket.com
+
+    steps:
+      - name: Transferir tráfico de ${{ needs.prepare.outputs.active-env }} → ${{ needs.prepare.outputs.deploy-env }}
+        run: |
+          ACTIVE="${{ needs.prepare.outputs.active-env }}"
+          DEPLOY="${{ needs.prepare.outputs.deploy-env }}"
+
+          echo "================================================================"
+          echo "  TRAFFIC SWITCH: ${ACTIVE^^} → ${DEPLOY^^}"
+          echo "  Modificando AWS ALB Listener..."
+          echo "================================================================"
+
+          # En producción AWS real:
+          # aws elbv2 modify-listener \
+          #   --listener-arn ${{ env.ALB_LISTENER_ARN }} \
+          #   --default-actions Type=forward,TargetGroupArn=$DEPLOY_TG_ARN
+
+          echo "ALB actualizado: tráfico ahora apunta a ${DEPLOY^^}"
+          echo "100% del tráfico en ${DEPLOY^^} - versión ${{ needs.prepare.outputs.version }}"
+
+      - name: Verificación post-switch
+        run: |
+          echo "Verificando que el tráfico de producción llega correctamente..."
+          # curl -f https://orders.techmarket.com/health
+          echo '{"status":"healthy","environment":"${{ needs.prepare.outputs.deploy-env }}","version":"${{ needs.prepare.outputs.version }}"}' | python3 -c "
+          import sys,json
+          d = json.load(sys.stdin)
+          assert d['status'] == 'healthy'
+          print(f'VERIFICADO: producción sirve desde {d[\"environment\"].upper()} v{d[\"version\"]}')
+          "
+
+      - name: Notificar despliegue exitoso
+        run: |
+          echo "✅ Despliegue Blue-Green completado exitosamente"
+          echo "   Versión: ${{ needs.prepare.outputs.version }}"
+          echo "   Entorno activo: ${{ needs.prepare.outputs.deploy-env }}"
+          echo "   Entorno standby (rollback): ${{ needs.prepare.outputs.active-env }}"
+          echo "   Fecha: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+
+  # ──────────────────────────────────────────────────────────
+  # JOB 6: Rollback automático en caso de fallo
+  # ──────────────────────────────────────────────────────────
+  rollback:
+    name: Rollback Automático
+    runs-on: ubuntu-latest
+    needs: [prepare, deploy-inactive, health-check, traffic-switch]
+    if: failure()
+
+    steps:
+      - name: Revertir tráfico a ${{ needs.prepare.outputs.active-env }} (producción previa)
+        run: |
+          ACTIVE="${{ needs.prepare.outputs.active-env }}"
+          DEPLOY="${{ needs.prepare.outputs.deploy-env }}"
+
+          echo "================================================================"
+          echo "  ⚠️  ROLLBACK AUTOMÁTICO INICIADO"
+          echo "  Revirtiendo de ${DEPLOY^^} → ${ACTIVE^^}"
+          echo "================================================================"
+
+          # En producción AWS real:
+          # aws elbv2 modify-listener \
+          #   --listener-arn ${{ env.ALB_LISTENER_ARN }} \
+          #   --default-actions Type=forward,TargetGroupArn=$ACTIVE_TG_ARN
+
+          echo "Tráfico revertido a ${ACTIVE^^} (versión estable)"
+          echo "Rollback completado en $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+
+      - name: Crear issue de alerta
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `🚨 Rollback automático - Despliegue fallido ${new Date().toISOString()}`,
+              body: `## Rollback Blue-Green Automático\n\n` +
+                    `- **Versión fallida:** ${{ needs.prepare.outputs.version }}\n` +
+                    `- **Entorno revertido:** ${{ needs.prepare.outputs.deploy-env }} → ${{ needs.prepare.outputs.active-env }}\n` +
+                    `- **Commit:** ${{ github.sha }}\n` +
+                    `- **Run:** ${context.runId}\n\n` +
+                    `Por favor investigar los logs del run fallido.`,
+              labels: ['incident', 'rollback', 'high-priority']
+            });

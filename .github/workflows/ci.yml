@@ -1,0 +1,140 @@
+name: CI - Build & Test
+
+on:
+  push:
+    branches: [main, develop, "feature/**"]
+  pull_request:
+    branches: [main]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}/orders
+
+jobs:
+  # ──────────────────────────────────────────────────────────
+  # JOB 1: Lint y análisis estático
+  # ──────────────────────────────────────────────────────────
+  lint:
+    name: Lint & Code Quality
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Configurar Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Instalar dependencias de lint
+        run: pip install flake8 black isort
+
+      - name: Verificar formato con Black
+        run: black --check src/
+
+      - name: Verificar imports con isort
+        run: isort --check-only src/
+
+      - name: Lint con flake8
+        run: flake8 src/ --max-line-length=120 --ignore=E501,W503
+
+  # ──────────────────────────────────────────────────────────
+  # JOB 2: Tests unitarios e integración
+  # ──────────────────────────────────────────────────────────
+  test:
+    name: Unit & Integration Tests
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Configurar Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Instalar dependencias
+        run: pip install -r src/requirements.txt
+
+      - name: Ejecutar tests con cobertura
+        run: |
+          pip install pytest-cov
+          pytest tests/ -v --cov=src --cov-report=xml --cov-report=term-missing
+
+      - name: Subir reporte de cobertura
+        uses: codecov/codecov-action@v4
+        if: always()
+        with:
+          file: ./coverage.xml
+          fail_ci_if_error: false
+
+  # ──────────────────────────────────────────────────────────
+  # JOB 3: Build y push de imagen Docker
+  # ──────────────────────────────────────────────────────────
+  build:
+    name: Build Docker Image
+    runs-on: ubuntu-latest
+    needs: test
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tags }}
+      image-digest: ${{ steps.build.outputs.digest }}
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Configurar Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login a GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extraer metadata para Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=sha,prefix=sha-
+
+      - name: Build y push imagen
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            APP_VERSION=${{ github.sha }}
+            ENVIRONMENT=staging
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Escanear vulnerabilidades con Trivy
+        uses: aquasecurity/trivy-action@0.20.0
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
+          format: "sarif"
+          output: "trivy-results.sarif"
+          ignore-unfixed: true
+          severity: "CRITICAL,HIGH"
+
+      - name: Subir resultados SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: "trivy-results.sarif"
