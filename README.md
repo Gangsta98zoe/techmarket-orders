@@ -224,3 +224,5 @@ Fowler, M. (2010, March 1). *BlueGreenDeployment*. Martin Fowler's Bliki. https:
 Kim, G., Humble, J., Debois, P., & Willis, J. (2016). *The DevOps handbook: How to create world-class agility, reliability, and security in technology organizations*. IT Revolution Press.
 
 Sato, D. (2014, June 25). *CanaryRelease*. Martin Fowler's Bliki. https://martinfowler.com/bliki/CanaryRelease.html
+
+Servando Soto
